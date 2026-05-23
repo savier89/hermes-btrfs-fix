@@ -1,0 +1,193 @@
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 7a30b7098..70bb20ccd 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1043,11 +1043,12 @@ def connect(
+             # sidecar files for a fresh database. Keep it in the same process-local
+             # critical section as schema initialization so concurrent gateway
+             # startup threads do not race before _INITIALIZED_PATHS is populated.
+-            # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
+-            # falls back to DELETE with one WARNING so kanban stays usable there.
+-            # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
++            # WAL doesn't work on network filesystems (NFS/SMB/FUSE) or BTRFS.
++            # Shared helper falls back to DELETE with one WARNING so kanban stays
++            # usable everywhere. See hermes_state._WAL_INCOMPAT_MARKERS and
++            # hermes_state._is_on_btrfs for detection logic.
+             from hermes_state import apply_wal_with_fallback
+-            apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
++            apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})", db_path=str(path))
+             conn.execute("PRAGMA synchronous=NORMAL")
+             conn.execute("PRAGMA foreign_keys=ON")
+             needs_init = resolved not in _INITIALIZED_PATHS
+diff --git a/hermes_state.py b/hermes_state.py
+index 0391047d0..5a29b5c51 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -57,6 +57,40 @@ _WAL_INCOMPAT_MARKERS = (
+     "disk i/o error",         # Flaky network FS during WAL setup
+ )
+ 
++
++def _is_on_btrfs(path: str) -> bool:
++    """Check if *path* resides on a BTRFS filesystem.
++
++    BTRFS Copy-on-Write semantics conflict with SQLite WAL mode —
++    concurrent readers/writers can trigger ``disk I/O error`` during
++    normal writes (not just WAL setup).  Force DELETE journal mode
++    on BTRFS to avoid silent corruption.
++    """
++    import pathlib
++
++    resolved = str(pathlib.Path(path).resolve())
++    try:
++        with open("/proc/self/mountinfo") as fh:
++            for line in fh:
++                # Format: ID PARENT_ID MAJ:MIN ROOT MOUNTPT OPTIONS - FSTYPE DEV SUPER_OPS
++                # The '-' separator after OPTIONS reliably precedes FSTYPE.
++                try:
++                    dash_idx = line.index("-")
++                except ValueError:
++                    continue
++                before = line[:dash_idx].split()
++                after = line[dash_idx + 1:].split()
++                if len(before) < 5 or len(after) < 1:
++                    continue
++                mount_point = before[4]
++                fstype = after[0] if after else ""
++                if resolved.startswith(mount_point + "/") or resolved == mount_point:
++                    return fstype.lower() == "btrfs"
++    except OSError:
++        pass
++    return False
++
++
+ # Last SessionDB() init error, per-process.  Surfaced in /resume and
+ # related slash-command error strings so users know WHY the DB is
+ # unavailable instead of getting a bare "Session database not available."
+@@ -129,15 +163,20 @@ def apply_wal_with_fallback(
+     conn: sqlite3.Connection,
+     *,
+     db_label: str = "state.db",
++    db_path: str = "",
+ ) -> str:
+     """Set ``journal_mode=WAL`` on ``conn``, falling back to DELETE on failure.
+ 
+     Returns the journal mode actually set (``"wal"`` or ``"delete"``).
+ 
+-    On WAL-incompatible filesystems (NFS, SMB, some FUSE), SQLite raises
+-    ``OperationalError("locking protocol")`` when setting WAL.  We fall
+-    back to DELETE mode — the pre-WAL default, which works on NFS — and
+-    log one WARNING explaining why.
++    On WAL-incompatible filesystems (NFS, SMB, some FUSE, BTRFS), SQLite
++    raises errors when using WAL.  We fall back to DELETE mode — the
++    pre-WAL default, which works everywhere — and log one WARNING
++    explaining why.
++
++    BTRFS Copy-on-Write semantics are known to cause silent ``disk I/O
++    error`` during WAL writes (not just setup), so we proactively skip
++    WAL on BTRFS entirely.
+ 
+     The WARNING is deduplicated per ``db_label``: repeated connections
+     to the same underlying DB (e.g. kanban_db.connect() which is called
+@@ -148,6 +187,14 @@ def apply_wal_with_fallback(
+     Shared by :class:`SessionDB` and ``hermes_cli.kanban_db.connect`` so
+     both databases get identical fallback behavior.
+     """
++    # Proactively skip WAL on BTRFS — COW causes disk I/O errors during
++    # writes, not just during WAL setup, so the exception-based fallback
++    # below would be too late (data is already corrupted).
++    if db_path and _is_on_btrfs(db_path):
++        conn.execute("PRAGMA journal_mode=DELETE")
++        _log_btrfs_fallback_once(db_label)
++        return "delete"
++
+     try:
+         conn.execute("PRAGMA journal_mode=WAL")
+         return "wal"
+@@ -182,6 +229,26 @@ def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
+         exc,
+     )
+ 
++
++def _log_btrfs_fallback_once(db_label: str) -> None:
++    """Log a single WARNING per (process, db_label) about BTRFS fallback.
++
++    Similar to _log_wal_fallback_once but specific to BTRFS COW detection.
++    """
++    with _wal_fallback_warned_lock:
++        if db_label in _wal_fallback_warned_paths:
++            return
++        _wal_fallback_warned_paths.add(db_label)
++    logger.warning(
++        "%s: BTRFS filesystem detected — using journal_mode=DELETE instead "
++        "of WAL to avoid COW-related disk I/O errors. BTRFS Copy-on-Write "
++        "semantics conflict with SQLite WAL mode and can cause silent "
++        "database corruption. See https://www.sqlite.org/wal.html for "
++        "details. This warning fires once per process per database.",
++        db_label,
++    )
++
++
+ SCHEMA_SQL = """
+ CREATE TABLE IF NOT EXISTS schema_version (
+     version INTEGER NOT NULL
+@@ -352,7 +419,7 @@ class SessionDB:
+                 isolation_level=None,
+             )
+             self._conn.row_factory = sqlite3.Row
+-            apply_wal_with_fallback(self._conn, db_label="state.db")
++            apply_wal_with_fallback(self._conn, db_label="state.db", db_path=str(self.db_path))
+             self._conn.execute("PRAGMA foreign_keys=ON")
+ 
+             self._init_schema()
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 387e27881..876ea62ec 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -1006,6 +1006,19 @@ def _parse_env_var(name: str, default: str, converter=int, type_label: str = "in
+         )
+ 
+ 
++def _safe_getcwd() -> str:
++    """Return the current working directory, falling back to home on error.
++
++    os.getcwd() raises FileNotFoundError if the process's CWD was
++    deleted (e.g. a temp directory cleaned up while the gateway was still
++    running).  This helper avoids crashing the cleanup thread.
++    """
++    try:
++        return os.getcwd()
++    except FileNotFoundError:
++        return str(Path.home())
++
++
+ def _get_env_config() -> Dict[str, Any]:
+     """Get terminal environment configuration from environment variables."""
+     # Default image with Python and Node.js for maximum compatibility
+@@ -1018,7 +1031,7 @@ def _get_env_config() -> Dict[str, Any]:
+     # remote home, Vercel uses its documented workspace root, and everything
+     # else starts in the backend's default root-like cwd.
+     if env_type == "local":
+-        default_cwd = os.getcwd()
++        default_cwd = _safe_getcwd()
+     elif env_type == "ssh":
+         default_cwd = "~"
+     elif env_type == "vercel_sandbox":
+@@ -1036,7 +1049,7 @@ def _get_env_config() -> Dict[str, Any]:
+     host_cwd = None
+     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
+     if env_type == "docker" and mount_docker_cwd:
+-        docker_cwd_source = os.getenv("TERMINAL_CWD") or os.getcwd()
++        docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
+         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
+         if (
+             any(candidate.startswith(p) for p in host_prefixes)
+@@ -2298,7 +2311,7 @@ if __name__ == "__main__":
+     print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")
+     print(f"  TERMINAL_MODAL_IMAGE: {os.getenv('TERMINAL_MODAL_IMAGE', default_img)}")
+     print(f"  TERMINAL_DAYTONA_IMAGE: {os.getenv('TERMINAL_DAYTONA_IMAGE', default_img)}")
+-    print(f"  TERMINAL_CWD: {os.getenv('TERMINAL_CWD', os.getcwd())}")
++    print(f"  TERMINAL_CWD: {os.getenv('TERMINAL_CWD', _safe_getcwd())}")
+     from hermes_constants import display_hermes_home as _dhh
+     print(f"  TERMINAL_SANDBOX_DIR: {os.getenv('TERMINAL_SANDBOX_DIR', f'{_dhh()}/sandboxes')}")
+     print(f"  TERMINAL_TIMEOUT: {os.getenv('TERMINAL_TIMEOUT', '60')}")
