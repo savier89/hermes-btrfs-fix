@@ -2,21 +2,21 @@
 """
 Tests for BTRFS + SQLite WAL retry fix (patch v3).
 
-Mimics the test approach from upstream PR #30700:
-- Mock connections that simulate transient failures
-- Verify retry logic (3 attempts, 1s delay)
-- Verify fallback to DELETE after exhaustion
-- Verify reraise for non-transient errors
-- Verify busy_timeout >= 30000
+Standalone tests that mock the upstream dependencies.
+Mimics the test approach from upstream PR #30700.
 """
 
 import sqlite3
 import sys
-import time
+import os
 from unittest.mock import Mock, patch, MagicMock
 
-# Add the patched module to path for testing
-sys.path.insert(0, '.')
+# Create minimal stubs for upstream dependencies
+sys.modules['agent'] = MagicMock()
+sys.modules['utils'] = MagicMock()
+sys.modules['hermes_logging'] = MagicMock()
+sys.modules['hermes_constants'] = MagicMock()
+sys.modules['hermes_time'] = MagicMock()
 
 
 def test_busy_timeout_is_at_least_30s():
@@ -135,7 +135,7 @@ def test_incompatible_fallback_immediate():
             result = hermes_state.apply_wal_with_fallback(mock_conn, db_label="test")
 
     assert result == "delete", f"Expected 'delete', got '{result}'"
-    # Should only have 2 executes: busy_timeout + WAL (then immediate fallback)
+    # Should only have a few executes: busy_timeout + WAL (then immediate fallback)
     assert execute_count[0] < 5, "Should fallback immediately, not retry"
     print(f"  ✓ Immediate fallback for incompatible filesystem")
 
