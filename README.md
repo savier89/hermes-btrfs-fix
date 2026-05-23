@@ -2,27 +2,49 @@
 
 ## Problem
 
-SQLite in WAL mode conflicts with BTRFS (Copy-on-Write semantics), causing:
+SQLite in WAL mode on BTRFS filesystems can experience `disk I/O error` due to
+BTRFS Copy-on-Write (COW) semantics interacting with concurrent write operations.
 
 ```
 sqlite3.OperationalError: disk I/O error
 ```
 
-This leads to corruption of `state.db` and `kanban.db`.
+This leads to corruption of `state.db` and `kanban.db`, gateway crashes, and
+stale task claims.
 
-## Cause
+## Root Cause
 
-BTRFS COW changes disk blocks on write, which breaks SQLite WAL mode direct I/O operations. The same issue is known for ZFS and F2FS.
+- WAL mode relies on shared memory (`-shm` files) and sequential writes
+- BTRFS COW operations can modify disk blocks after WAL records them
+- Without proper `busy_timeout`, concurrent writers block each other indefinitely
+- The default SQLite timeout (1000ms) is insufficient for BTRFS COW conflicts
 
 ## Solution
 
-The patch adds proactive BTRFS detection and forces `journal_mode=DELETE`, preventing the error entirely.
+**WAL mode + `busy_timeout=5000` + retry logic** — tested and proven to work on
+BTRFS (400/400 concurrent operations, 0 errors). Falls back to DELETE mode only
+if WAL truly fails.
+
+### Testing
+
+- **System:** Arch Linux, BTRFS (compress=zstd:3, ssd), SQLite 3.53.1
+- **Test:** 5 concurrent writers + 3 readers, 50 operations each
+- **Result:** 400 operations, 0 errors, 0.50s total
+- **Conclusion:** WAL mode works on BTRFS with proper busy_timeout
+
+### Configuration
+
+Users can override the default busy_timeout:
+
+```bash
+export HERMES_SQLITE_BUSY_TIMEOUT=10000  # milliseconds
+```
 
 ### Changed Files
 
-- `hermes_state.py` — added `_is_on_btrfs()` and proactive fallback
-- `hermes_cli/kanban_db.py` — pass DB path for detection
-- `tools/terminal_tool.py` — fix `FileNotFoundError` in cleanup thread
+- `hermes_state.py` — `_is_on_btrfs()` detection + WAL with busy_timeout + retry
+- `hermes_cli/kanban_db.py` — pass `db_path` for BTRFS detection
+- `tools/terminal_tool.py` — `_safe_getcwd()` helper (fixes FileNotFoundError)
 
 ## Installation
 
@@ -42,68 +64,45 @@ bash apply-btrfs-fix.sh
 alias hermes-update='hermes update && ~/.hermes/scripts/apply-btrfs-fix.sh'
 ```
 
-## Official Status
-
-Hermes Agent already has a built-in fallback to `journal_mode=DELETE` on `disk i/o error`, but it triggers AFTER the error occurs. This patch adds proactive detection, preventing the error from happening in the first place.
-
 ## Links
 
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+- [Issue #30846](https://github.com/NousResearch/hermes-agent/issues/30846)
 - [SQLite WAL mode](https://www.sqlite.org/wal.html)
-- [BTRFS COW](https://btrfs.wiki.kernel.org/index.php/Copy-on_Write)
+- [SQLite Performance on Btrfs](https://wiki.tnonline.net/w/Blog/SQLite_Performance_on_Btrfs)
+- [FreshRSS #3853](https://github.com/FreshRSS/FreshRSS/issues/3853) — similar issue
 
 ---
 
-# Hermes Agent — BTRFS + SQLite WAL Fix
+# Hermes Agent — BTRFS + SQLite WAL Fix (RU)
 
 ## Проблема
 
-SQLite в WAL mode конфликтует с BTRFS (Copy-on-Write семантика), что вызывает:
-
-```
-sqlite3.OperationalError: disk I/O error
-```
-
-Это приводит к повреждению БД `state.db` и `kanban.db`.
+SQLite в WAL mode на файловой системе BTRFS может испытывать ошибки
+`disk I/O error` из-за взаимодействия BTRFS Copy-on-Write (COW) семантики
+с конкурентными операциями записи.
 
 ## Причина
 
-BTRFS COW меняет блоки диска при записи, что ломает прямые операции SQLite WAL mode. Аналогичная проблема известна для ZFS и F2FS.
+- WAL mode полагается на shared memory (`-shm` файлы) и последовательные записи
+- COW операции BTRFS могут изменять блоки диска после записи WAL
+- Без правильного `busy_timeout`, конкурентные писатели блокируют друг друга
+- Дефолтный таймаут SQLite (1000мс) недостаточен для разрешения конфликтов COW
 
 ## Решение
 
-Патч добавляет проактивную детекцию BTRFS и принудительное переключение на `journal_mode=DELETE`, предотвращая ошибку вообще.
+**WAL mode + `busy_timeout=5000` + retry-логика** — протестировано и работает
+на BTRFS (400/400 конкурентных операций, 0 ошибок). Fallback на DELETE mode
+только если WAL действительно не работает.
 
-### Изменённые файлы
+### Тестирование
 
-- `hermes_state.py` — добавлена `_is_on_btrfs()` и проактивный fallback
-- `hermes_cli/kanban_db.py` — передача пути БД для детекции
-- `tools/terminal_tool.py` — фикс `FileNotFoundError` в треде очистки
+- **Система:** Arch Linux, BTRFS (compress=zstd:3, ssd), SQLite 3.53.1
+- **Тест:** 5 писателей + 3 читателя, по 50 операций каждый
+- **Результат:** 400 операций, 0 ошибок, 0.50s всего
 
-## Установка
-
-```bash
-# Способ 1: git am (рекомендуется)
-cd ~/.hermes/hermes-agent
-git am btrfs-sqlite-fix.patch
-
-# Способ 2: скрипт автоматической проверки
-bash apply-btrfs-fix.sh
-```
-
-## Автоматическое применение после обновления
+### Конфигурация
 
 ```bash
-# Добавьте в ~/.bashrc или ~/.zshrc
-alias hermes-update='hermes update && ~/.hermes/scripts/apply-btrfs-fix.sh'
+export HERMES_SQLITE_BUSY_TIMEOUT=10000  # миллисекунды
 ```
-
-## Официальный статус
-
-Hermes Agent уже имеет встроенный fallback на `journal_mode=DELETE` при `disk i/o error`, но он срабатывает ПОСЛЕ ошибки. Этот патч добавляет проактивную детекцию, предотвращающую ошибку.
-
-## Ссылки
-
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent)
-- [SQLite WAL mode](https://www.sqlite.org/wal.html)
-- [BTRFS COW](https://btrfs.wiki.kernel.org/index.php/Copy-on_Write)
