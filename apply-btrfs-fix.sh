@@ -15,16 +15,23 @@ if [[ ! -f "$PATCH_FILE" ]]; then
     exit 1
 fi
 
-# Check if our patch is already applied (v3 markers)
-if grep -q "_WAL_TRANSIENT_MARKERS" "$STATE_FILE" 2>/dev/null; then
-    echo "OK: BTRFS fix (v3) already applied — skipping."
+# Check if v4 is already applied (has _try_fallback_delete)
+if grep -q "_try_fallback_delete" "$STATE_FILE" 2>/dev/null; then
+    echo "OK: BTRFS fix (v4) already applied — skipping."
     exit 0
+fi
+
+# Check if v3 is applied (has _WAL_TRANSIENT_MARKERS but no _try_fallback_delete)
+if grep -q "_WAL_TRANSIENT_MARKERS" "$STATE_FILE" 2>/dev/null; then
+    echo "WARN: BTRFS fix (v3) detected — upgrading to v4..."
+    echo "       v3 had unprotected DELETE fallback that crashed on BTRFS."
+    # Revert old changes before applying new patch
+    git -C "$HERMES_DIR" checkout -- "$STATE_FILE" "$TERMINAL_FILE" 2>/dev/null || true
 fi
 
 # Check if old patch is applied (v1/v2 markers)
 if grep -q "_is_on_btrfs" "$STATE_FILE" 2>/dev/null; then
-    echo "WARN: Old BTRFS fix (v1/v2) detected. Removing and applying v3..."
-    # Revert old changes before applying new patch
+    echo "WARN: Old BTRFS fix (v1/v2) detected. Removing and applying v4..."
     git -C "$HERMES_DIR" checkout -- "$STATE_FILE" "$TERMINAL_FILE" 2>/dev/null || true
 fi
 
@@ -35,7 +42,7 @@ if grep -q "_WAL_SETUP_MAX_ATTEMPTS" "$STATE_FILE" 2>/dev/null; then
 fi
 
 # Apply the patch
-echo "Applying BTRFS + SQLite WAL fix (v3)..."
+echo "Applying BTRFS + SQLite WAL fix (v4)..."
 if git -C "$HERMES_DIR" am "$PATCH_FILE" 2>/dev/null; then
     echo "DONE: Patch applied successfully via git am."
 else
@@ -48,8 +55,13 @@ else
     fi
 fi
 
-# Restart gateway to apply changes
-echo "Restarting hermes-gateway..."
-systemctl --user restart hermes-gateway 2>/dev/null || echo "WARN: Could not restart gateway"
+# Restart all gateway services to apply changes
+echo "Restarting Hermes gateways..."
+for svc in hermes-gateway-coder hermes-gateway-researcher hermes-gateway; do
+    if systemctl --user list-unit-files "$svc.service" 2>/dev/null | grep -q "$svc"; then
+        echo "  Restarting $svc..."
+        systemctl --user restart "$svc" 2>/dev/null || echo "  WARN: Could not restart $svc"
+    fi
+done
 
-echo "DONE: BTRFS fix applied and gateway restarted."
+echo "DONE: BTRFS fix v4 applied and gateways restarted."

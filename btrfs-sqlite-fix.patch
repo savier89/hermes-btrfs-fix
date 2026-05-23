@@ -1,9 +1,12 @@
 diff --git a/hermes_state.py b/hermes_state.py
-index 0391047d0..28fc5be96 100644
+index 0391047d0..67dcfa51a 100644
 --- a/hermes_state.py
 +++ b/hermes_state.py
-@@ -57,6 +57,33 @@ _WAL_INCOMPAT_MARKERS = (
-     "disk i/o error",         # Flaky network FS during WAL setup
+@@ -54,9 +54,35 @@ SCHEMA_VERSION = 13
+ _WAL_INCOMPAT_MARKERS = (
+     "locking protocol",       # SQLITE_PROTOCOL on NFS/SMB
+     "not authorized",         # Some FUSE mounts block WAL pragma outright
+-    "disk i/o error",         # Flaky network FS during WAL setup
  )
  
 +# Transient markers that may clear on retry (e.g., BTRFS COW races,
@@ -36,7 +39,43 @@ index 0391047d0..28fc5be96 100644
  # Last SessionDB() init error, per-process.  Surfaced in /resume and
  # related slash-command error strings so users know WHY the DB is
  # unavailable instead of getting a bare "Session database not available."
-@@ -139,6 +166,12 @@ def apply_wal_with_fallback(
+@@ -125,6 +151,35 @@ def format_session_db_unavailable(prefix: str = "Session database not available"
+     return f"{prefix}: {cause}{hint}."
+ 
+ 
++def _try_fallback_delete(conn: sqlite3.Connection, db_label: str) -> str:
++    """Try to switch to DELETE journal mode; return current mode if that fails.
++
++    On BTRFS with concurrent processes, even PRAGMA journal_mode=DELETE can
++    raise ``disk i/o error`` when the connection is in a bad state after
++    failed WAL attempts.  In that case we check the current mode and accept
++    whatever SQLite has us on, rather than letting the error propagate and
++    crash the caller (e.g. kanban dispatcher tick).
++    """
++    try:
++        conn.execute("PRAGMA journal_mode=DELETE")
++        return "delete"
++    except sqlite3.OperationalError as exc2:
++        # Even DELETE failed — check what mode we're actually on
++        try:
++            current = conn.execute("PRAGMA journal_mode").fetchone()
++            mode = current[0] if current else "unknown"
++        except Exception:
++            mode = "unknown"
++        logger.warning(
++            "kanban WAL→DELETE fallback also failed (%s); current mode=%s — "
++            "continuing anyway (db_label=%s)",
++            exc2,
++            mode,
++            db_label,
++        )
++        return mode
++
++
+ def apply_wal_with_fallback(
+     conn: sqlite3.Connection,
+     *,
+@@ -139,6 +194,12 @@ def apply_wal_with_fallback(
      back to DELETE mode — the pre-WAL default, which works on NFS — and
      log one WARNING explaining why.
  
@@ -49,7 +88,7 @@ index 0391047d0..28fc5be96 100644
      The WARNING is deduplicated per ``db_label``: repeated connections
      to the same underlying DB (e.g. kanban_db.connect() which is called
      on every kanban operation) log once per process, not once per call.
-@@ -148,17 +181,39 @@ def apply_wal_with_fallback(
+@@ -148,17 +209,36 @@ def apply_wal_with_fallback(
      Shared by :class:`SessionDB` and ``hermes_cli.kanban_db.connect`` so
      both databases get identical fallback behavior.
      """
@@ -79,13 +118,11 @@ index 0391047d0..28fc5be96 100644
 +                    continue
 +                # Exhausted retries — fall back to DELETE
 +                _log_wal_fallback_once(db_label, last_exc)
-+                conn.execute("PRAGMA journal_mode=DELETE")
-+                return "delete"
++                return _try_fallback_delete(conn, db_label)
 +            # Incompatible filesystem (NFS/SMB) — immediate fallback
 +            if any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
 +                _log_wal_fallback_once(db_label, exc)
-+                conn.execute("PRAGMA journal_mode=DELETE")
-+                return "delete"
++                return _try_fallback_delete(conn, db_label)
              # Unrelated OperationalError — don't silently swallow.
              raise
 -        _log_wal_fallback_once(db_label, exc)
@@ -93,16 +130,15 @@ index 0391047d0..28fc5be96 100644
 -        return "delete"
 +    # Should not reach here, but fallback just in case
 +    _log_wal_fallback_once(db_label, last_exc)
-+    conn.execute("PRAGMA journal_mode=DELETE")
-+    return "delete"
++    return _try_fallback_delete(conn, db_label)
  
  
  def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
-@@ -182,6 +237,9 @@ def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
+@@ -182,6 +262,9 @@ def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
          exc,
      )
  
-+
+ 
 +
 +
  SCHEMA_SQL = """
