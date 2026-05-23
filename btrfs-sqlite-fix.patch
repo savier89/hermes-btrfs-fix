@@ -1,94 +1,94 @@
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 33de8945f..1b7203d10 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1176,11 +1176,12 @@ def connect(
+             # sidecar files for a fresh database. Keep it in the same process-local
+             # critical section as schema initialization so concurrent gateway
+             # startup threads do not race before _INITIALIZED_PATHS is populated.
+-            # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
+-            # falls back to DELETE with one WARNING so kanban stays usable there.
+-            # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
++            # WAL doesn't work on network filesystems (NFS/SMB/FUSE) or BTRFS.
++            # Shared helper falls back to DELETE with one WARNING so kanban stays
++            # usable everywhere. See hermes_state._WAL_INCOMPAT_MARKERS and
++            # hermes_state._is_on_btrfs for detection logic.
+             from hermes_state import apply_wal_with_fallback
+-            apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
++            apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})", db_path=str(path))
+             conn.execute("PRAGMA synchronous=NORMAL")
+             conn.execute("PRAGMA foreign_keys=ON")
+             needs_init = resolved not in _INITIALIZED_PATHS
 diff --git a/hermes_state.py b/hermes_state.py
-index 0391047d0..67dcfa51a 100644
+index 0391047d0..37ffa48cd 100644
 --- a/hermes_state.py
 +++ b/hermes_state.py
-@@ -54,9 +54,35 @@ SCHEMA_VERSION = 13
- _WAL_INCOMPAT_MARKERS = (
-     "locking protocol",       # SQLITE_PROTOCOL on NFS/SMB
-     "not authorized",         # Some FUSE mounts block WAL pragma outright
--    "disk i/o error",         # Flaky network FS during WAL setup
+@@ -57,6 +57,39 @@ _WAL_INCOMPAT_MARKERS = (
+     "disk i/o error",         # Flaky network FS during WAL setup
  )
  
-+# Transient markers that may clear on retry (e.g., BTRFS COW races,
-+# concurrent WAL checkpoint, short-lived busy states).  Distinct from
-+# _WAL_INCOMPAT_MARKERS which indicate permanent filesystem incompatibility.
-+_WAL_TRANSIENT_MARKERS = (
-+    "database is locked",
-+    "database table is locked",
-+    "database is busy",
-+    "database schema is locked",
-+    "disk i/o error",         # Also transient on BTRFS during checkpoint races
-+)
 +
-+# Retry configuration for WAL setup.  On filesystems with Copy-on-Write
-+# semantics (BTRFS, ZFS) or under high concurrency, transient locking
-+# errors may occur during WAL initialization.  Retry with backoff gives
-+# SQLite time to settle before falling back to DELETE mode.
-+#
-+# Users can override via environment variables:
-+#   HERMES_SQLITE_BUSY_TIMEOUT=30000  # milliseconds (default: 30000)
-+#   HERMES_SQLITE_WAL_RETRIES=3       # max attempts (default: 3)
-+#   HERMES_SQLITE_WAL_RETRY_DELAY=1.0 # seconds between attempts (default: 1.0)
-+import os as _os
-+_STATE_DB_BUSY_TIMEOUT_MS = int(_os.environ.get("HERMES_SQLITE_BUSY_TIMEOUT", "30000"))
-+_WAL_SETUP_MAX_ATTEMPTS = int(_os.environ.get("HERMES_SQLITE_WAL_RETRIES", "3"))
-+_WAL_SETUP_RETRY_DELAY_S = float(_os.environ.get("HERMES_SQLITE_WAL_RETRY_DELAY", "1.0"))
-+del _os
++def _is_on_btrfs(path: str) -> bool:
++    """Check if *path* resides on a BTRFS filesystem.
 +
++    BTRFS Copy-on-Write semantics conflict with SQLite WAL mode —
++    concurrent readers/writers can trigger ``disk I/O error`` during
++    normal writes (not just WAL setup).  Force DELETE journal mode
++    on BTRFS to avoid silent corruption.
++    """
++    import pathlib
++
++    resolved = str(pathlib.Path(path).resolve())
++    try:
++        with open("/proc/self/mountinfo") as fh:
++            for line in fh:
++                # Format: ID PARENT_ID MAJ:MIN ROOT MOUNTPT OPTIONS - FSTYPE DEV SUPER_OPS
++                # The '-' separator after OPTIONS reliably precedes FSTYPE.
++                try:
++                    dash_idx = line.index("-")
++                except ValueError:
++                    continue
++                before = line[:dash_idx].split()
++                after = line[dash_idx + 1:].split()
++                if len(before) < 5 or len(after) < 1:
++                    continue
++                mount_point = before[4]
++                fstype = after[0] if after else ""
++                if resolved.startswith(mount_point + "/") or resolved == mount_point:
++                    return fstype.lower() == "btrfs"
++    except OSError:
++        pass
++    return False
 +
  # Last SessionDB() init error, per-process.  Surfaced in /resume and
  # related slash-command error strings so users know WHY the DB is
  # unavailable instead of getting a bare "Session database not available."
-@@ -125,6 +151,35 @@ def format_session_db_unavailable(prefix: str = "Session database not available"
-     return f"{prefix}: {cause}{hint}."
- 
- 
-+def _try_fallback_delete(conn: sqlite3.Connection, db_label: str) -> str:
-+    """Try to switch to DELETE journal mode; return current mode if that fails.
-+
-+    On BTRFS with concurrent processes, even PRAGMA journal_mode=DELETE can
-+    raise ``disk i/o error`` when the connection is in a bad state after
-+    failed WAL attempts.  In that case we check the current mode and accept
-+    whatever SQLite has us on, rather than letting the error propagate and
-+    crash the caller (e.g. kanban dispatcher tick).
-+    """
-+    try:
-+        conn.execute("PRAGMA journal_mode=DELETE")
-+        return "delete"
-+    except sqlite3.OperationalError as exc2:
-+        # Even DELETE failed — check what mode we're actually on
-+        try:
-+            current = conn.execute("PRAGMA journal_mode").fetchone()
-+            mode = current[0] if current else "unknown"
-+        except Exception:
-+            mode = "unknown"
-+        logger.warning(
-+            "kanban WAL→DELETE fallback also failed (%s); current mode=%s — "
-+            "continuing anyway (db_label=%s)",
-+            exc2,
-+            mode,
-+            db_label,
-+        )
-+        return mode
-+
-+
- def apply_wal_with_fallback(
+@@ -129,15 +162,20 @@ def apply_wal_with_fallback(
      conn: sqlite3.Connection,
      *,
-@@ -139,6 +194,12 @@ def apply_wal_with_fallback(
-     back to DELETE mode — the pre-WAL default, which works on NFS — and
-     log one WARNING explaining why.
+     db_label: str = "state.db",
++    db_path: str = "",
+ ) -> str:
+     """Set ``journal_mode=WAL`` on ``conn``, falling back to DELETE on failure.
  
-+    For transient errors (``database is locked``, ``disk i/o error`` on
-+    BTRFS during checkpoint races), we retry up to ``_WAL_SETUP_MAX_ATTEMPTS``
-+    times with ``_WAL_SETUP_RETRY_DELAY_S`` delay between attempts before
-+    giving up.  This handles COW filesystems (BTRFS, ZFS) and high-concurrency
-+    scenarios without needing filesystem-specific detection.
+     Returns the journal mode actually set (``"wal"`` or ``"delete"``).
+ 
+-    On WAL-incompatible filesystems (NFS, SMB, some FUSE), SQLite raises
+-    ``OperationalError("locking protocol")`` when setting WAL.  We fall
+-    back to DELETE mode — the pre-WAL default, which works on NFS — and
+-    log one WARNING explaining why.
++    On WAL-incompatible filesystems (NFS, SMB, some FUSE), SQLite
++    raises errors when using WAL.  We fall back to DELETE mode — the
++    pre-WAL default, which works everywhere — and log one WARNING
++    explaining why.
 +
++    BTRFS Copy-on-Write semantics can cause ``disk I/O error`` during
++    WAL writes, so we try WAL with increased busy_timeout first, then
++    fall back to DELETE if errors occur.
+ 
      The WARNING is deduplicated per ``db_label``: repeated connections
      to the same underlying DB (e.g. kanban_db.connect() which is called
-     on every kanban operation) log once per process, not once per call.
-@@ -148,17 +209,36 @@ def apply_wal_with_fallback(
+@@ -148,17 +186,29 @@ def apply_wal_with_fallback(
      Shared by :class:`SessionDB` and ``hermes_cli.kanban_db.connect`` so
      both databases get identical fallback behavior.
      """
@@ -98,54 +98,74 @@ index 0391047d0..67dcfa51a 100644
 -    except sqlite3.OperationalError as exc:
 -        msg = str(exc).lower()
 -        if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
-+    import time
-+
-+    # Set busy_timeout for the connection (used by all subsequent operations)
-+    conn.execute(f"PRAGMA busy_timeout={_STATE_DB_BUSY_TIMEOUT_MS}")
-+
-+    last_exc = None
-+    for attempt in range(_WAL_SETUP_MAX_ATTEMPTS):
-+        try:
-+            conn.execute("PRAGMA journal_mode=WAL")
-+            return "wal"
-+        except sqlite3.OperationalError as exc:
-+            msg = str(exc).lower()
-+            # Transient error — retry
-+            if any(marker in msg for marker in _WAL_TRANSIENT_MARKERS):
-+                last_exc = exc
-+                if attempt < _WAL_SETUP_MAX_ATTEMPTS - 1:
-+                    time.sleep(_WAL_SETUP_RETRY_DELAY_S)
-+                    continue
-+                # Exhausted retries — fall back to DELETE
-+                _log_wal_fallback_once(db_label, last_exc)
-+                return _try_fallback_delete(conn, db_label)
-+            # Incompatible filesystem (NFS/SMB) — immediate fallback
-+            if any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
-+                _log_wal_fallback_once(db_label, exc)
-+                return _try_fallback_delete(conn, db_label)
-             # Unrelated OperationalError — don't silently swallow.
-             raise
+-            # Unrelated OperationalError — don't silently swallow.
+-            raise
 -        _log_wal_fallback_once(db_label, exc)
 -        conn.execute("PRAGMA journal_mode=DELETE")
 -        return "delete"
-+    # Should not reach here, but fallback just in case
-+    _log_wal_fallback_once(db_label, last_exc)
-+    return _try_fallback_delete(conn, db_label)
++    # Try WAL mode with increased busy_timeout for better concurrency
++    import time
++    last_exc = None
++    for attempt in range(3):
++        try:
++            conn.execute("PRAGMA journal_mode=WAL")
++            conn.execute("PRAGMA busy_timeout=30000")  # 30 seconds
++            return "wal"
++        except sqlite3.OperationalError as exc:
++            last_exc = exc
++            msg = str(exc).lower()
++            if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
++                # Unrelated OperationalError — don't silently swallow.
++                raise
++            if attempt < 2:
++                time.sleep(1)  # Wait before retry
++                continue
++            # Final fallback to DELETE mode
++            break
++    if last_exc:
++        _log_wal_fallback_once(db_label, last_exc)
++    conn.execute("PRAGMA journal_mode=DELETE")
++    return "delete"
  
  
  def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
-@@ -182,6 +262,9 @@ def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
+@@ -182,6 +232,25 @@ def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
          exc,
      )
  
- 
 +
++def _log_btrfs_fallback_once(db_label: str) -> None:
++    """Log a single WARNING per (process, db_label) about BTRFS fallback.
++
++    Similar to _log_wal_fallback_once but specific to BTRFS COW detection.
++    """
++    with _wal_fallback_warned_lock:
++        if db_label in _wal_fallback_warned_paths:
++            return
++        _wal_fallback_warned_paths.add(db_label)
++    logger.warning(
++        "%s: BTRFS filesystem detected — using journal_mode=DELETE instead "
++        "of WAL to avoid COW-related disk I/O errors. BTRFS Copy-on-Write "
++        "semantics conflict with SQLite WAL mode and can cause silent "
++        "database corruption. See https://www.sqlite.org/wal.html for "
++        "details. This warning fires once per process per database.",
++        db_label,
++    )
 +
  SCHEMA_SQL = """
  CREATE TABLE IF NOT EXISTS schema_version (
      version INTEGER NOT NULL
+@@ -352,7 +421,7 @@ class SessionDB:
+                 isolation_level=None,
+             )
+             self._conn.row_factory = sqlite3.Row
+-            apply_wal_with_fallback(self._conn, db_label="state.db")
++            apply_wal_with_fallback(self._conn, db_label="state.db", db_path=str(self.db_path))
+             self._conn.execute("PRAGMA foreign_keys=ON")
+ 
+             self._init_schema()
 diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
-index 387e27881..876ea62ec 100644
+index 387e27881..eb9a10c6e 100644
 --- a/tools/terminal_tool.py
 +++ b/tools/terminal_tool.py
 @@ -1006,6 +1006,19 @@ def _parse_env_var(name: str, default: str, converter=int, type_label: str = "in
@@ -155,7 +175,7 @@ index 387e27881..876ea62ec 100644
 +def _safe_getcwd() -> str:
 +    """Return the current working directory, falling back to home on error.
 +
-+    os.getcwd() raises FileNotFoundError if the process's CWD was
++    ``os.getcwd()`` raises ``FileNotFoundError`` if the process's CWD was
 +    deleted (e.g. a temp directory cleaned up while the gateway was still
 +    running).  This helper avoids crashing the cleanup thread.
 +    """
@@ -168,16 +188,20 @@ index 387e27881..876ea62ec 100644
  def _get_env_config() -> Dict[str, Any]:
      """Get terminal environment configuration from environment variables."""
      # Default image with Python and Node.js for maximum compatibility
-@@ -1018,7 +1031,7 @@ def _get_env_config() -> Dict[str, Any]:
+@@ -1018,7 +1031,11 @@ def _get_env_config() -> Dict[str, Any]:
      # remote home, Vercel uses its documented workspace root, and everything
      # else starts in the backend's default root-like cwd.
      if env_type == "local":
 -        default_cwd = os.getcwd()
-+        default_cwd = _safe_getcwd()
++        try:
++            default_cwd = os.getcwd()
++        except FileNotFoundError:
++            # CWD was deleted (e.g. temp dir cleaned up). Fall back to home.
++            default_cwd = str(Path.home())
      elif env_type == "ssh":
          default_cwd = "~"
      elif env_type == "vercel_sandbox":
-@@ -1036,7 +1049,7 @@ def _get_env_config() -> Dict[str, Any]:
+@@ -1036,7 +1053,7 @@ def _get_env_config() -> Dict[str, Any]:
      host_cwd = None
      host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
      if env_type == "docker" and mount_docker_cwd:
@@ -186,7 +210,7 @@ index 387e27881..876ea62ec 100644
          candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
          if (
              any(candidate.startswith(p) for p in host_prefixes)
-@@ -2298,7 +2311,7 @@ if __name__ == "__main__":
+@@ -2298,7 +2315,7 @@ if __name__ == "__main__":
      print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")
      print(f"  TERMINAL_MODAL_IMAGE: {os.getenv('TERMINAL_MODAL_IMAGE', default_img)}")
      print(f"  TERMINAL_DAYTONA_IMAGE: {os.getenv('TERMINAL_DAYTONA_IMAGE', default_img)}")
