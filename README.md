@@ -1,49 +1,49 @@
-# Hermes Agent — BTRFS + SQLite WAL Fix
+# Hermes Agent — SQLite WAL Retry Fix
 
 ## Problem
 
-SQLite in WAL mode on BTRFS filesystems can experience `disk I/O error` due to
-BTRFS Copy-on-Write (COW) semantics interacting with concurrent write operations.
+SQLite in WAL mode can experience transient locking errors under high concurrency
+or on filesystems with Copy-on-Write semantics (BTRFS, ZFS):
 
 ```
+sqlite3.OperationalError: database is locked
 sqlite3.OperationalError: disk I/O error
 ```
 
-This leads to corruption of `state.db` and `kanban.db`, gateway crashes, and
-stale task claims.
+These errors occur during WAL initialization (`PRAGMA journal_mode=WAL`) and
+write transactions (`BEGIN IMMEDIATE`), causing gateway crashes and stale task
+claims.
 
 ## Root Cause
 
 - WAL mode relies on shared memory (`-shm` files) and sequential writes
-- BTRFS COW operations can modify disk blocks after WAL records them
-- Without proper `busy_timeout`, concurrent writers block each other indefinitely
-- The default SQLite timeout (1000ms) is insufficient for BTRFS COW conflicts
+- On BTRFS/ZFS, COW operations can cause transient blocking during checkpoint races
+- Under high concurrency, multiple writers compete for database locks
+- The default SQLite timeout (1 second) is insufficient for these scenarios
+- The existing fallback only handled permanent filesystem incompatibility (NFS/SMB)
 
 ## Solution
 
-**WAL mode + `busy_timeout=5000` + retry logic** — tested and proven to work on
-BTRFS (400/400 concurrent operations, 0 errors). Falls back to DELETE mode only
-if WAL truly fails.
+**Retry logic + increased busy_timeout** for transient WAL setup errors:
 
-### Testing
-
-- **System:** Arch Linux, BTRFS (compress=zstd:3, ssd), SQLite 3.53.1
-- **Test:** 5 concurrent writers + 3 readers, 50 operations each
-- **Result:** 400 operations, 0 errors, 0.50s total
-- **Conclusion:** WAL mode works on BTRFS with proper busy_timeout
+1. Set `busy_timeout=30000` (30 seconds) on all connections
+2. Retry WAL setup up to 3 times with 1 second delay
+3. Fall back to DELETE mode only after exhausting retries
+4. Distinguish transient errors (retry) from incompatible filesystems (immediate fallback)
 
 ### Configuration
 
-Users can override the default busy_timeout:
+Users can override defaults via environment variables:
 
 ```bash
-export HERMES_SQLITE_BUSY_TIMEOUT=10000  # milliseconds
+export HERMES_SQLITE_BUSY_TIMEOUT=30000  # milliseconds (default: 30000)
+export HERMES_SQLITE_WAL_RETRIES=3       # max attempts (default: 3)
+export HERMES_SQLITE_WAL_RETRY_DELAY=1.0 # seconds between attempts (default: 1.0)
 ```
 
 ### Changed Files
 
-- `hermes_state.py` — `_is_on_btrfs()` detection + WAL with busy_timeout + retry
-- `hermes_cli/kanban_db.py` — pass `db_path` for BTRFS detection
+- `hermes_state.py` — retry logic + busy_timeout + transient error classification
 - `tools/terminal_tool.py` — `_safe_getcwd()` helper (fixes FileNotFoundError)
 
 ## Installation
@@ -57,52 +57,47 @@ git am btrfs-sqlite-fix.patch
 bash apply-btrfs-fix.sh
 ```
 
-## Automatic Application After Update
-
-```bash
-# Add to ~/.bashrc or ~/.zshrc
-alias hermes-update='hermes update && ~/.hermes/scripts/apply-btrfs-fix.sh'
-```
-
 ## Links
 
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 - [Issue #30846](https://github.com/NousResearch/hermes-agent/issues/30846)
+- [PR #30700](https://github.com/NousResearch/hermes-agent/pull/30700) — related retry approach
 - [SQLite WAL mode](https://www.sqlite.org/wal.html)
 - [SQLite Performance on Btrfs](https://wiki.tnonline.net/w/Blog/SQLite_Performance_on_Btrfs)
-- [FreshRSS #3853](https://github.com/FreshRSS/FreshRSS/issues/3853) — similar issue
 
 ---
 
-# Hermes Agent — BTRFS + SQLite WAL Fix (RU)
+# Hermes Agent — SQLite WAL Retry Fix (RU)
 
 ## Проблема
 
-SQLite в WAL mode на файловой системе BTRFS может испытывать ошибки
-`disk I/O error` из-за взаимодействия BTRFS Copy-on-Write (COW) семантики
-с конкурентными операциями записи.
+SQLite в WAL mode может испытывать транзентные ошибки блокировки при высокой
+конкурентности или на файловых системах с Copy-on-Write (BTRFS, ZFS):
+
+```
+sqlite3.OperationalError: database is locked
+sqlite3.OperationalError: disk I/O error
+```
 
 ## Причина
 
-- WAL mode полагается на shared memory (`-shm` файлы) и последовательные записи
-- COW операции BTRFS могут изменять блоки диска после записи WAL
-- Без правильного `busy_timeout`, конкурентные писатели блокируют друг друга
-- Дефолтный таймаут SQLite (1000мс) недостаточен для разрешения конфликтов COW
+- WAL mode полагается на shared memory и последовательные записи
+- На BTRFS/ZFS COW операции вызывают временные блокировки
+- При высокой конкурентности писатели конкурируют за блоки
+- Дефолтный таймаут SQLite (1 сек) недостаточен
 
 ## Решение
 
-**WAL mode + `busy_timeout=5000` + retry-логика** — протестировано и работает
-на BTRFS (400/400 конкурентных операций, 0 ошибок). Fallback на DELETE mode
-только если WAL действительно не работает.
+**Retry-логика + увеличенный busy_timeout** для транзентных ошибок WAL:
 
-### Тестирование
-
-- **Система:** Arch Linux, BTRFS (compress=zstd:3, ssd), SQLite 3.53.1
-- **Тест:** 5 писателей + 3 читателя, по 50 операций каждый
-- **Результат:** 400 операций, 0 ошибок, 0.50s всего
+1. `busy_timeout=30000` (30 секунд) для всех соединений
+2. До 3 попыток с задержкой 1 секунда
+3. Fallback на DELETE только после исчерпания попыток
 
 ### Конфигурация
 
 ```bash
-export HERMES_SQLITE_BUSY_TIMEOUT=10000  # миллисекунды
+export HERMES_SQLITE_BUSY_TIMEOUT=30000  # миллисекунды
+export HERMES_SQLITE_WAL_RETRIES=3       # макс попыток
+export HERMES_SQLITE_WAL_RETRY_DELAY=1.0 # секунды между попытками
 ```
