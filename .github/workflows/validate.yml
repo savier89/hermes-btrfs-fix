@@ -58,16 +58,14 @@ jobs:
       - name: Prepare test environment
         run: |
           mkdir -p test_env/tools
-          # Get upstream files
           curl -sL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/hermes_state.py -o test_env/hermes_state.py
           curl -sL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/tools/terminal_tool.py -o test_env/tools/terminal_tool.py
-          # Create __init__.py files
           touch test_env/__init__.py test_env/tools/__init__.py
-          # Apply patch
           cd test_env && patch -p1 < ../btrfs-sqlite-fix.patch || true
           echo "Test environment ready"
 
       - name: Run tests
+        working-directory: .
         run: |
-          cd test_env
-          PYTHONPATH=".." python ../test_btrfs_fix.py
+          export PYTHONPATH="${PYTHONPATH}:$(pwd)/test_env"
+          python test_btrfs_fix.py
