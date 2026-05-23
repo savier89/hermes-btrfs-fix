@@ -55,21 +55,19 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Clone minimal hermes-agent for testing
+      - name: Prepare test environment
         run: |
-          # Get just the files we need to test against
           mkdir -p test_env/tools
+          # Get upstream files
           curl -sL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/hermes_state.py -o test_env/hermes_state.py
           curl -sL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/tools/terminal_tool.py -o test_env/tools/terminal_tool.py
+          # Create __init__.py files
           touch test_env/__init__.py test_env/tools/__init__.py
-
-      - name: Apply patch to test environment
-        run: |
-          cd test_env
-          patch -p1 < ../btrfs-sqlite-fix.patch || true
-          echo "Patch applied"
+          # Apply patch
+          cd test_env && patch -p1 < ../btrfs-sqlite-fix.patch || true
+          echo "Test environment ready"
 
       - name: Run tests
         run: |
           cd test_env
-          python ../test_btrfs_fix.py
+          PYTHONPATH=".." python ../test_btrfs_fix.py
