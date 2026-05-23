@@ -44,3 +44,32 @@ jobs:
           test -f README.md || { echo "README missing"; exit 1; }
           grep -q "database is locked" README.md || { echo "README should mention actual error"; exit 1; }
           echo "README: OK"
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Clone minimal hermes-agent for testing
+        run: |
+          # Get just the files we need to test against
+          mkdir -p test_env/tools
+          curl -sL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/hermes_state.py -o test_env/hermes_state.py
+          curl -sL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/tools/terminal_tool.py -o test_env/tools/terminal_tool.py
+          touch test_env/__init__.py test_env/tools/__init__.py
+
+      - name: Apply patch to test environment
+        run: |
+          cd test_env
+          patch -p1 < ../btrfs-sqlite-fix.patch || true
+          echo "Patch applied"
+
+      - name: Run tests
+        run: |
+          cd test_env
+          python ../test_btrfs_fix.py
