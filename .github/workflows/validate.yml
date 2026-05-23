@@ -1,0 +1,46 @@
+name: Validate Patch
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check patch file exists
+        run: |
+          test -f btrfs-sqlite-fix.patch || { echo "Patch file missing"; exit 1; }
+          echo "Patch file: OK"
+
+      - name: Validate patch format
+        run: |
+          grep -q "^diff --git" btrfs-sqlite-fix.patch || { echo "Invalid patch format"; exit 1; }
+          grep -q "^--- a/hermes_state.py" btrfs-sqlite-fix.patch || { echo "Missing hermes_state.py"; exit 1; }
+          grep -q "^--- a/tools/terminal_tool.py" btrfs-sqlite-fix.patch || { echo "Missing terminal_tool.py"; exit 1; }
+          echo "Patch format: OK"
+
+      - name: Check for secrets leakage
+        run: |
+          if grep -iE '(token|password|secret|api_key|private_key).*=.*["\x27][^"\x27]+' btrfs-sqlite-fix.patch; then
+            echo "ERROR: Possible secret leakage detected"
+            exit 1
+          fi
+          echo "No secrets detected: OK"
+
+      - name: Check script syntax
+        run: |
+          bash -n apply-btrfs-fix.sh && echo "Script syntax: OK"
+
+      - name: Check README
+        run: |
+          test -f README.md || { echo "README missing"; exit 1; }
+          grep -q "database is locked" README.md || { echo "README should mention actual error"; exit 1; }
+          echo "README: OK"
